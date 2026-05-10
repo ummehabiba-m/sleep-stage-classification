@@ -1,0 +1,262 @@
+name: Sleep Stage Classification CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:       # Allow manual runs
+    inputs:
+      run_training:
+        description: 'Run full model training?'
+        required: true
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+env:
+  PYTHON_VERSION: "3.12"
+  MODEL_REGISTRY: "models"
+
+jobs:
+  # ─────────────────────────────────────────
+  # JOB 1: Lint & static checks
+  # ─────────────────────────────────────────
+  lint:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install flake8 black isort
+
+      - name: Check formatting (black)
+        run: black --check src/ tests/
+
+      - name: Check imports (isort)
+        run: isort --check-only src/ tests/
+
+      - name: Lint (flake8)
+        run: flake8 src/ tests/ --max-line-length=100 --ignore=E203,W503
+
+  # ─────────────────────────────────────────
+  # JOB 2: Unit & integration tests
+  # ─────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ -v \
+            --tb=short \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -x
+
+      - name: Run integration tests
+        run: |
+          pytest tests/integration/ -v \
+            --tb=short \
+            -x
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: coverage.xml
+          fail_ci_if_error: false
+
+  # ─────────────────────────────────────────
+  # JOB 3: Data validation
+  # ─────────────────────────────────────────
+  validate-data:
+    name: Validate Data Pipeline
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run data validation checks
+        run: python scripts/validate_data.py --dry-run
+
+      - name: Check preprocessing pipeline
+        run: pytest tests/unit/test_preprocessing.py -v
+
+  # ─────────────────────────────────────────
+  # JOB 4: Model training (on-demand or main branch)
+  # ─────────────────────────────────────────
+  train:
+    name: Train Model
+    runs-on: ubuntu-latest        # swap to self-hosted GPU runner for real training
+    needs: [test, validate-data]
+    if: |
+      github.ref == 'refs/heads/main' ||
+      github.event.inputs.run_training == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download dataset (PhysioNet subset)
+        run: python scripts/download_data.py --n-subjects 5
+        env:
+          PHYSIONET_USER: ${{ secrets.PHYSIONET_USER }}
+          PHYSIONET_PASS: ${{ secrets.PHYSIONET_PASS }}
+
+      - name: Preprocess data
+        run: python scripts/preprocess.py --config configs/default.yaml
+
+      - name: Train model
+        run: |
+          python scripts/train.py \
+            --config configs/default.yaml \
+            --output-dir ${{ env.MODEL_REGISTRY }}
+        env:
+          WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}    # optional: W&B logging
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model-${{ github.sha }}
+          path: |
+            ${{ env.MODEL_REGISTRY }}/best_model.pth
+            ${{ env.MODEL_REGISTRY }}/results.json
+          retention-days: 30
+
+  # ─────────────────────────────────────────
+  # JOB 5: Evaluate & gate on metrics
+  # ─────────────────────────────────────────
+  evaluate:
+    name: Evaluate Model
+    runs-on: ubuntu-latest
+    needs: train
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download trained model
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-model-${{ github.sha }}
+          path: ${{ env.MODEL_REGISTRY }}
+
+      - name: Run evaluation
+        run: |
+          python scripts/evaluate.py \
+            --model ${{ env.MODEL_REGISTRY }}/best_model.pth \
+            --results ${{ env.MODEL_REGISTRY }}/results.json \
+            --min-kappa 0.70 \
+            --min-accuracy 0.80
+
+      - name: Upload evaluation report
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-report-${{ github.sha }}
+          path: reports/
+          retention-days: 30
+
+  # ─────────────────────────────────────────
+  # JOB 6: Build inference Docker image
+  # ─────────────────────────────────────────
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: evaluate
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download trained model
+        uses: actions/download-artifact@v4
+        with:
+          name: trained-model-${{ github.sha }}
+          path: ${{ env.MODEL_REGISTRY }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: |
+            ghcr.io/${{ github.repository }}/sleep-classifier:latest
+            ghcr.io/${{ github.repository }}/sleep-classifier:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ─────────────────────────────────────────
+  # JOB 7: Deploy (main branch only)
+  # ─────────────────────────────────────────
+  deploy:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: staging
+      url: https://sleep-classifier.yourdomain.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging server
+        run: |
+          echo "Deploying ghcr.io/${{ github.repository }}/sleep-classifier:${{ github.sha }}"
+          # Replace with your actual deployment command, e.g.:
+          # ssh user@server "docker pull ... && docker-compose up -d"
+        env:
+          DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+
+      - name: Smoke test deployment
+        run: python scripts/smoke_test.py --url https://sleep-classifier.yourdomain.com
