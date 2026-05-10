@@ -1,4 +1,4 @@
-# 🧠 Deep Learning for Automated Sleep Stage Classification
+#  Deep Learning for Automated Sleep Stage Classification
 
 > **Course:** AI341 - Deep Learning  
 > **Instructor:** Talha Ishfaq  
